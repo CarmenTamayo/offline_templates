@@ -1,0 +1,170 @@
+---
+title: "Template RST South Sudan"
+output: 
+ html_document:
+    code_folding: "hide"
+date: "`r Sys.Date()`"
+params:
+  file_path:
+    label: "Please provide the path to the file with your linelist data"
+    value: "data/mpox_data_gh_burundi.csv"
+  disease_name: 
+    label: "Name of the disease of interest"
+    value: "Mpox"
+  date_column:
+    label: "Please indicate the name of the column in your dataset that contains the dates when cases were identified"
+    value: "Date_confirmation"
+  deaths_column:
+    label: "Please indicate the name of the column in your dataset that contains the dates when deaths occurred"
+    value: "Death_date"
+  reporting_delay:
+    label: "Please provide the estimated number of days between disease onset and case reporting (if unknown, leave as NA)"
+    value: "2"
+    choices: ["NA", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+---
+
+
+```{r settings, echo = FALSE}
+knitr::opts_chunk$set(
+  fig.width = 9,
+  fig.height = 5,
+  dpi = 90,
+  collapse = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  out.width = "100%"
+)
+```
+
+```{r, echo=FALSE, include=FALSE}
+renv::restore()
+```
+## Loading packages
+
+``` {r}
+library(dplyr)
+library(incidence2)
+library(epiparameter)
+library(EpiNow2)
+library(cfr)
+library(ggplot2)
+library(knitr)
+```
+
+## Reading in data
+
+```{r}
+# Load in data
+linelist <- read.csv(params$file_path)
+```
+
+
+## Converting linelist to incidence
+
+```{r}
+incidence_data <- linelist %>%
+  incidence2::incidence(date_index = params$date_column,
+                        interval = "day",
+                        date_names_to = "date",
+                        count_values_to = "confirm") %>%
+  select(-count_variable)
+
+ggplot(incidence_data, aes(x = date, y = confirm)) +
+  geom_col(fill = "darkblue") +
+  labs(x = NULL, y = "Case incidence") +
+  scale_x_date(date_breaks = "10 days", date_labels = "%b %d") +
+  theme_minimal() 
+
+```
+
+# Serial interval
+
+```{r}
+si_epidist <- epiparameter_db(
+  disease = params$disease_name,
+  epi_dist = "serial interval",
+  single_epiparameter = TRUE
+)
+
+# Discretising and formatting for EpiNow2
+si_epidist_disc <- epiparameter::discretise(si_epidist)
+si_params <- epiparameter::get_parameters(si_epidist_disc)
+si_max <- quantile(si_epidist_disc, 0.999)
+
+si_for_epinow <- Gamma(
+  shape = si_params[[1]],
+  scale = si_params[[2]],
+  max = si_max
+)
+
+plot(si_epidist_disc)
+```
+The mean serial interval period for `r params$disease_name` is of `r si_epidist$summary_stats$mean` days, as described in the literature by `r  si_epidist$citation$author[1]`  et al `r si_epidist$citation$year`.
+
+# Incubation period
+
+```{r}
+ip_epidist <- epiparameter_db(
+  disease = params$disease_name,
+  epi_dist = "incubation",
+  single_epiparameter = TRUE
+)
+
+# Discretising and formatting for EpiNow2
+ip_disc <- epiparameter::discretise(ip_epidist)
+ip_params <- epiparameter::get_parameters(ip_epidist)
+ip_max <- quantile(ip_epidist, 0.999)
+
+ip_for_epinow <- LogNormal(
+  meanlog = ip_params[[1]],
+  sdlog = ip_params[[2]],
+  max = ip_max
+)
+
+plot(ip_disc)
+```
+The mean incubation period for `r params$disease_name` is of `r ip_epidist$summary_stats$mean` days, as described in the literature by `r  ip_epidist$citation$author[1]`  et al `r ip_epidist$citation$year`.
+
+# Estimating infections
+
+```{r, eval=params$reporting_delay == "NA", include=params$reporting_delay == "NA", warning=FALSE, message=FALSE}
+epinow_estimates <- epinow(
+  data = incidence_data, # time series data
+  generation_time = generation_time_opts(si_for_epinow), # assume generation time = serial interval
+  delays = delay_opts(ip_for_epinow), # delay from infection-to-onset
+  obs = obs_opts(na = "accumulate"),
+  rt = NULL
+)
+epinow_estimates$plots$infections
+```
+
+
+```{r, eval=params$reporting_delay != "NA", include=params$reporting_delay != "NA"}
+
+rep_delay_params <- epiparameter::convert_summary_stats_to_params(
+  "lnorm", mean = as.numeric(params$reporting_delay), sd = 0.5
+)
+rep_delay_for_epinow <- LogNormal(
+  meanlog = rep_delay_params$meanlog,
+  sdlog = rep_delay_params$sdlog,
+  max = 20 
+)
+epinow_estimates <- epinow(
+  data = incidence_data, # time series data
+  generation_time = generation_time_opts(si_for_epinow), # assume generation time = serial interval
+  delays = delay_opts(ip_for_epinow + rep_delay_for_epinow), # delay from infection-to-onset
+  obs = obs_opts(na = "accumulate"),
+  rt = NULL
+)
+epinow_estimates$plots$infections
+```
+
+```{r}
+epinow_estimates$summary %>% 
+  select(measure, estimate) %>%
+  kable(caption = "Summary of Estimates")
+```
+
+
+
+
